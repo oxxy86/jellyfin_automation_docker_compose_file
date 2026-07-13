@@ -7,7 +7,7 @@
   vars:
     base_dir: "{{ ansible_env.HOME }}/automation"
     username: "media"
-    password: "Teena.ishot86"
+    password: ""
     timezone: "Australia/Perth"
     
     # Storage Mounts
