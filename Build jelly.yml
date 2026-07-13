@@ -1,0 +1,244 @@
+---
+- name: Deploy and Automate Jellyfin Media Stack with Container IPs
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    base_dir: "{{ ansible_env.HOME }}/automation"
+    username: "media"
+    password: "Teena.ishot86"
+    timezone: "Australia/Perth"
+    
+    # Storage Mounts
+    downloads_mount: "/mnt/smb/downloads"
+    movies_mount: "/mnt/smb/movies"
+    tv_mount: "/mnt/smb/tv"
+
+  tasks:
+    - name: Ensure configuration directories exist
+      file:
+        path: "{{ base_dir }}/{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - jellyfin/config
+        - jellyfin/cache
+        - jellyseerr/config
+        - radarr/config
+        - sonarr/config
+        - prowlarr/config
+        - qbittorrent/config
+
+    - name: Write out docker-compose.yml
+      copy:
+        dest: "{{ base_dir }}/docker-compose.yml"
+        content: |
+          services:
+            jellyfin:
+              image: jellyfin/jellyfin:latest
+              container_name: jellyfin
+              network_mode: host
+              environment:
+                - TZ={{ timezone }}
+              volumes:
+                - ./jellyfin/config:/config
+                - ./jellyfin/cache:/cache
+                - {{ movies_mount }}/:/media/movies:ro
+                - {{ tv_mount }}/:/media/tv:ro
+              devices:
+                - /dev/dri/renderD128:/dev/dri/renderD128
+              restart: unless-stopped
+
+            jellyseerr:
+              image: fallenbagel/jellyseerr:latest
+              container_name: jellyseerr
+              environment:
+                - LOG_LEVEL=info
+                - TZ={{ timezone }}
+              volumes:
+                - ./jellyseerr/config:/app/config
+              ports:
+                - 5055:5055
+              restart: unless-stopped
+
+            radarr:
+              image: lscr.io/linuxserver/radarr:latest
+              container_name: radarr
+              environment:
+                - PUID=1000
+                - PGID=1000
+                - TZ={{ timezone }}
+              volumes:
+                - ./radarr/config:/config
+                - {{ movies_mount }}:/movies
+                - {{ downloads_mount }}:/downloads
+              ports:
+                - 7878:7878
+              restart: unless-stopped
+
+            sonarr:
+              image: lscr.io/linuxserver/sonarr:latest
+              container_name: sonarr
+              environment:
+                - PUID=1000
+                - PGID=1000
+                - TZ={{ timezone }}
+              volumes:
+                - ./sonarr/config:/config
+                - {{ tv_mount }}:/tv
+                - {{ downloads_mount }}:/downloads
+              ports:
+                - 8989:8989
+              restart: unless-stopped
+
+            prowlarr:
+              image: lscr.io/linuxserver/prowlarr:latest
+              container_name: prowlarr
+              environment:
+                - PUID=1000
+                - PGID=1000
+                - TZ={{ timezone }}
+              volumes:
+                - ./prowlarr/config:/config
+              ports:
+                - 9696:9696
+              restart: unless-stopped
+
+            qbittorrent:
+              image: lscr.io/linuxserver/qbittorrent:latest
+              container_name: qbittorrent
+              environment:
+                - PUID=1000
+                - PGID=1000
+                - TZ={{ timezone }}
+                - WEBUI_PORT=8080
+              volumes:
+                - ./qbittorrent/config:/config
+                - {{ downloads_mount }}:/downloads
+              ports:
+                - 8080:8080
+                - 6881:6881
+                - 6881:6881/udp
+              restart: unless-stopped
+
+    - name: Start the Docker Compose stack
+      community.docker.docker_compose_v2:
+        project_src: "{{ base_dir }}"
+        state: present
+
+    - name: Wait for services to fully initialize APIs
+      wait_for:
+        port: "{{ item }}"
+        delay: 5
+        timeout: 60
+      loop: [7878, 8989, 9696, 8080]
+
+    # --- Inspect Container Networking ---
+    - name: Get Prowlarr container networking info
+      community.docker.docker_container_info:
+        name: prowlarr
+      register: prowlarr_info
+
+    - name: Get Radarr container networking info
+      community.docker.docker_container_info:
+        name: radarr
+      register: radarr_info
+
+    - name: Get Sonarr container networking info
+      community.docker.docker_container_info:
+        name: sonarr
+      register: sonarr_info
+
+    # --- Extract API Keys ---
+    - name: Extract Radarr API key from config file
+      xml:
+        path: "{{ base_dir }}/radarr/config/config.xml"
+        xpath: /Config/ApiKey
+        content: text
+      register: radarr_api_xml
+
+    - name: Extract Sonarr API key from config file
+      xml:
+        path: "{{ base_dir }}/sonarr/config/config.xml"
+        xpath: /Config/ApiKey
+        content: text
+      register: sonarr_api_xml
+
+    - name: Extract Prowlarr API key from config file
+      xml:
+        path: "{{ base_dir }}/prowlarr/config/config.xml"
+        xpath: /Config/ApiKey
+        content: text
+      register: prowlarr_api_xml
+
+    # --- API Configuration Actions ---
+    - name: Set up Forms Authentication on Prowlarr
+      uri:
+        url: "http://{{ prowlarr_info.container.NetworkSettings.Networks.values() | first | attr('IPAddress') }}:9696/api/v1/config/authentication"
+        method: PUT
+        headers:
+          X-Api-Key: "{{ prowlarr_api_xml.matches[0].ApiKey }}"
+        body_format: json
+        body:
+          authenticationMethod: "forms"
+          username: "{{ username }}"
+          password: "{{ password }}"
+        status_code: [200, 202]
+
+    - name: Connect Radarr inside Prowlarr using Container IPs
+      uri:
+        url: "http://{{ prowlarr_info.container.NetworkSettings.Networks.values() | first | attr('IPAddress') }}:9696/api/v1/applications"
+        method: POST
+        headers:
+          X-Api-Key: "{{ prowlarr_api_xml.matches[0].ApiKey }}"
+        body_format: json
+        body:
+          name: "Radarr"
+          implementation: "Radarr"
+          configContract: "RadarrSettings"
+          fields:
+            - name: "prowlarrUrl"
+              value: "http://{{ prowlarr_info.container.NetworkSettings.Networks.values() | first | attr('IPAddress') }}:9696"
+            - name: "baseUrl"
+              value: "http://{{ radarr_info.container.NetworkSettings.Networks.values() | first | attr('IPAddress') }}:7878"
+            - name: "apiKey"
+              value: "{{ radarr_api_xml.matches[0].ApiKey }}"
+        status_code: 201
+
+    - name: Connect Sonarr inside Prowlarr using Container IPs
+      uri:
+        url: "http://{{ prowlarr_info.container.NetworkSettings.Networks.values() | first | attr('IPAddress') }}:9696/api/v1/applications"
+        method: POST
+        headers:
+          X-Api-Key: "{{ prowlarr_api_xml.matches[0].ApiKey }}"
+        body_format: json
+        body:
+          name: "Sonarr"
+          implementation: "Sonarr"
+          configContract: "SonarrSettings"
+          fields:
+            - name: "prowlarrUrl"
+              value: "http://{{ prowlarr_info.container.NetworkSettings.Networks.values() | first | attr('IPAddress') }}:9696"
+            - name: "baseUrl"
+              value: "http://{{ sonarr_info.container.NetworkSettings.Networks.values() | first | attr('IPAddress') }}:8989"
+            - name: "apiKey"
+              value: "{{ sonarr_api_xml.matches[0].ApiKey }}"
+        status_code: 201
+
+    - name: Add Popular Public Torrent Indexer (e.g., 1337x) to Prowlarr
+      uri:
+        url: "http://{{ prowlarr_info.container.NetworkSettings.Networks.values() | first | attr('IPAddress') }}:9696/api/v1/indexer"
+        method: POST
+        headers:
+          X-Api-Key: "{{ prowlarr_api_xml.matches[0].ApiKey }}"
+        body_format: json
+        body:
+          name: "1337x"
+          protocol: "torrent"
+          implementation: "Cardigann"
+          configContract: "CardigannSettings"
+          fields:
+            - name: "baseUrl"
+              value: "https://1337x.to"
+        status_code: 201
