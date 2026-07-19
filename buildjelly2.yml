@@ -121,8 +121,8 @@
       - VPN_TYPE=openvpn
       - SERVER_REGIONS=CA Montreal
       - VPN_PORT_FORWARDING=true
-      - OPENVPN_USER=p4610190
-      - OPENVPN_PASSWORD=Teena.ishot86
+      - OPENVPN_USER=
+      - OPENVPN_PASSWORD=
       - DOT=false
       - TZ=Australia/Perth
       - DNS_ADDRESS=1.1.1.1
